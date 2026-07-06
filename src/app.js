@@ -57,25 +57,101 @@ function normalizeExpense(item) {
 }
 
 function getSupabaseClient() {
-  return window.supabaseClient;
+  return window.supabaseClient || null;
+}
+
+function isSupabaseReady(client = getSupabaseClient()) {
+  return Boolean(client && client.auth && typeof client.auth.getSession === 'function');
+}
+
+function getLocalStorageKey(prefix, userId = '') {
+  return `finance-app:${prefix}${userId ? `:${userId}` : ''}`;
+}
+
+function getLocalUser() {
+  try {
+    const stored = localStorage.getItem(getLocalStorageKey('current-user'));
+    return stored ? JSON.parse(stored) : null;
+  } catch (error) {
+    console.warn('Não foi possível ler o usuário local.', error);
+    return null;
+  }
+}
+
+function setLocalUser(user) {
+  try {
+    localStorage.setItem(getLocalStorageKey('current-user'), JSON.stringify(user));
+  } catch (error) {
+    console.warn('Não foi possível salvar o usuário local.', error);
+  }
+}
+
+function clearLocalUser() {
+  localStorage.removeItem(getLocalStorageKey('current-user'));
+}
+
+function getLocalUsers() {
+  try {
+    const stored = localStorage.getItem(getLocalStorageKey('users'));
+    return stored ? JSON.parse(stored) : [];
+  } catch (error) {
+    console.warn('Não foi possível ler os usuários locais.', error);
+    return [];
+  }
+}
+
+function setLocalUsers(users) {
+  try {
+    localStorage.setItem(getLocalStorageKey('users'), JSON.stringify(users));
+  } catch (error) {
+    console.warn('Não foi possível salvar os usuários locais.', error);
+  }
+}
+
+function getLocalExpenses(userId) {
+  try {
+    const stored = localStorage.getItem(getLocalStorageKey('expenses', userId));
+    return stored ? JSON.parse(stored) : [];
+  } catch (error) {
+    console.warn('Não foi possível ler os gastos locais.', error);
+    return [];
+  }
+}
+
+function setLocalExpenses(userId, expenses) {
+  try {
+    localStorage.setItem(getLocalStorageKey('expenses', userId), JSON.stringify(expenses));
+  } catch (error) {
+    console.warn('Não foi possível salvar os gastos locais.', error);
+  }
+}
+
+async function hashPassword(password) {
+  const data = new TextEncoder().encode(password);
+  const buffer = await crypto.subtle.digest('SHA-256', data);
+  return Array.from(new Uint8Array(buffer)).map((byte) => byte.toString(16).padStart(2, '0')).join('');
 }
 
 async function getCurrentUser(client = getSupabaseClient()) {
-  if (!client) return null;
-
-  try {
-    const { data: { session }, error } = await client.auth.getSession();
-    if (error) throw error;
-    return session?.user ?? null;
-  } catch (error) {
-    console.warn('Não foi possível obter o usuário atual.', error);
-    return null;
+  if (isSupabaseReady(client)) {
+    try {
+      const { data: { session }, error } = await client.auth.getSession();
+      if (error) throw error;
+      return session?.user ?? null;
+    } catch (error) {
+      console.warn('Não foi possível obter o usuário atual.', error);
+      return null;
+    }
   }
+
+  return getLocalUser();
 }
 
 async function ensureUserProfile(client) {
   const user = await getCurrentUser(client);
   if (!user) return;
+
+  if (!isSupabaseReady(client)) return;
 
   const { error } = await client.from('profiles').upsert(
     { id: user.id, email: user.email },
@@ -90,6 +166,10 @@ async function fetchExpenses() {
   const user = await getCurrentUser(client);
   if (!user) {
     return [];
+  }
+
+  if (!isSupabaseReady(client)) {
+    return getLocalExpenses(user.id);
   }
 
   try {
@@ -131,7 +211,14 @@ async function saveExpense(payload) {
     throw new Error('Usuário não autenticado');
   }
 
-  const payloadWithUser = { ...payload, user_id: user.id };
+  const payloadWithUser = { ...payload, user_id: user.id, id: crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}` };
+
+  if (!isSupabaseReady(client)) {
+    const expenses = getLocalExpenses(user.id);
+    expenses.push(payloadWithUser);
+    setLocalExpenses(user.id, expenses);
+    return [payloadWithUser];
+  }
 
   try {
     const response = await fetch(`${getApiBaseUrl()}/api/expenses`, {
@@ -166,6 +253,12 @@ async function deleteExpense(id) {
   const user = await getCurrentUser(client);
   if (!user) {
     throw new Error('Usuário não autenticado');
+  }
+
+  if (!isSupabaseReady(client)) {
+    const expenses = getLocalExpenses(user.id).filter((item) => String(item.id) !== String(id));
+    setLocalExpenses(user.id, expenses);
+    return true;
   }
 
   try {
@@ -273,6 +366,43 @@ async function handleAuth(mode) {
   }
 
   try {
+    if (!isSupabaseReady(client)) {
+      const hashedPassword = await hashPassword(password);
+      const users = getLocalUsers();
+
+      if (mode === 'signup') {
+        if (users.some((user) => user.email.toLowerCase() === email.toLowerCase())) {
+          setAuthFeedback('Este e-mail já está cadastrado no modo local.', true);
+          return;
+        }
+
+        const newUser = {
+          id: crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}`,
+          email,
+          passwordHash: hashedPassword
+        };
+
+        users.push(newUser);
+        setLocalUsers(users);
+        setLocalUser(newUser);
+        setAuthFeedback('Conta criada com sucesso no modo local.');
+      } else {
+        const user = users.find((item) => item.email.toLowerCase() === email.toLowerCase());
+        if (!user || user.passwordHash !== hashedPassword) {
+          setAuthFeedback('E-mail ou senha inválidos no modo local.', true);
+          return;
+        }
+
+        setLocalUser(user);
+        setAuthFeedback('Login realizado com sucesso no modo local.');
+      }
+
+      authForm.reset();
+      await updateAuthView();
+      await loadExpenses();
+      return;
+    }
+
     let result;
     if (mode === 'signup') {
       result = await client.auth.signUp({ email, password });
@@ -301,7 +431,13 @@ async function handleAuth(mode) {
 
 async function logout() {
   const client = getSupabaseClient();
-  if (!client) return;
+  if (!isSupabaseReady(client) || typeof client.auth.signOut !== 'function') {
+    clearLocalUser();
+    await updateAuthView();
+    renderExpenses([]);
+    return;
+  }
+
   await client.auth.signOut();
   await updateAuthView();
   renderExpenses([]);
@@ -313,6 +449,20 @@ async function handleForgotPassword() {
 
   if (!email) {
     setAuthFeedback('Informe o e-mail para recuperar a senha.', true);
+    return;
+  }
+
+  if (!isSupabaseReady(client)) {
+    const users = getLocalUsers();
+    const user = users.find((item) => item.email.toLowerCase() === email.toLowerCase());
+
+    if (!user) {
+      setAuthFeedback('Nenhuma conta local foi encontrada para este e-mail.', true);
+      return;
+    }
+
+    setAuthFeedback('Recuperação local habilitada. Para este modo, use a conta local criada anteriormente.');
+    recoveryEmail.value = '';
     return;
   }
 

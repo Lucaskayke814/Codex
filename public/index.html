@@ -126,13 +126,21 @@
       </div>
     </div>
 
-    <script src="./config.js"></script>
     <script type="module">
       import { loadAppConfig } from '../src/config.js';
       import { initializeSupabaseClient } from '../src/supabase-client.js';
 
-      const config = loadAppConfig();
-      window.supabaseClient = initializeSupabaseClient(config);
+      try {
+        const config = loadAppConfig();
+        console.info('Configuração do Supabase carregada:', {
+          hasUrl: Boolean(config.supabaseUrl),
+          hasAnonKey: Boolean(config.supabaseAnonKey)
+        });
+        window.supabaseClient = initializeSupabaseClient(config);
+      } catch (error) {
+        console.error('Falha ao inicializar o Supabase.', error);
+        window.supabaseClient = null;
+      }
     </script>
     <script src="../src/app.js?v=20260706"></script>
   </body>
